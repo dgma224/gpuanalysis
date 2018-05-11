@@ -1,0 +1,47 @@
+This code is meant to analyze any given data files using the user's choice of filter. 
+
+To run the code, simply use ./gpuanalyzer
+
+For inputs: the code does not expect any command line inputs. It uses files
+For the files, they need to be called param.dat and dataloc.dat.
+
+param.dat: This file contains information about the filter that will be used.
+There are two options: trapezoidal and custom
+For trapezoidal, the expected parameter file format is the following:
+
+"trapfilter np top rise tau":
+	trapfilter is the filter type
+	np:(integer) the number of points, for most of our uses this is 3500
+	top:(integer) length of the top of the trapezoid
+	rise:(integer) rise time of trapezoid (usually the same as tau)
+	tau:(float) decay constant of trapezoid
+
+For a custom filter defined by the user:
+	filterloc: (string) This is the location on disk of the custom filter
+	np:(integer) the number of points, for most of our uses this is 3500
+	scale:(float) this is a scaling factor for the convolution
+		Note: the convolution is normalized already, but some filters require extra scaling. This is where that term goes. The code will multiply by the value provided here
+
+	NOTE: for custom filters, they must be the same length as np in their data files. This code will not pad them as needed.
+
+The second input file, dataloc.dat is used to tell the code where the data files are located. This can be formated any way so long as there is a space between each name. The locations do not have to be in the directory of the code. 
+
+The output files will be output in the same location as the input, but with the name modified by adding an _res before .bin. 
+
+Input/Output Format:
+For the Input and Output data files, the pattern is exactly the same. The header format is below.
+
+At start of file: 1 8 Byte long
+
+Each waveform:
+	result: 1 byte bool
+	EventID: 4 byte int
+	BoardID: 4 byte int
+	Channel: 4 byte int
+	req: 8 Byte Unsigned Long
+	timestamp: 8 byte unsigned long
+	length: 4 byte int (should always be 3500)
+	waveform: length shorts (length*2 Bytes)
+
+The output follows this exact same format currently (will be updated to floats when I can work on a computer with more RAM, my laptop doesn't have enough). 
+
