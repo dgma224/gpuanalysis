@@ -1,0 +1,5 @@
+This repository is meant for work on the Nab Experiment: Each directory corresponds to a different analysis machine or process:
+
+gpufilter: a simple analysis code that can utilize any filter given. Simply takes files input and outputs them to the same location. Does no analysis on the resulting waveforms, merely outputs them.
+
+
