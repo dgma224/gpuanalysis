@@ -66,6 +66,7 @@ void DataOutput(WAVEFORM*,short**, PARAMS, int,int,double);
 void getdatafiles(PARAMS&);
 void baselineshift(short*,PARAMS);
 void waveshift(Complex *, Complex *,PARAMS);
+void ShortToComplex(short **, Complex *, int, int, int);
 
 //debug printing functions
 void ComplexDebug(Complex*,int,char*);
@@ -233,6 +234,16 @@ __global__ void multiplication(Complex *data, Complex *filter, int length, float
 	}
 }
 
+void ShortToComplex(short **sdata, Complex *cdata, int startloc, int batchsize, int length){
+  for(int i = 0;i<batchsize;i++){
+    for(int j = 0;j<length;j++){
+      cdata[i*length+j].x=sdata[i+startloc*batchsize][j];
+      cdata[i*length+j].y=0.0;
+    }
+  }
+}
+      
+
 void GPUConvolution(short** hostwaves,Complex *gpuwaves, Complex *gpufilter,cufftHandle plan, int numbatch, int leftover, PARAMS param, size_t bulksize,int batchsize){
   checkCudaErrors(cudaSetDevice(0));
   //first make this the simplistic version, then will optimize later
@@ -250,12 +261,7 @@ void GPUConvolution(short** hostwaves,Complex *gpuwaves, Complex *gpufilter,cuff
   for(int batch=0;batch<numbatch;batch++){
     //copy waveforms over
     std::cout<<batch<<" : "<<numbatch<<std::endl;
-    for(int i = 0;i<batchsize;i++){
-      for(int j = 0;j<param.newlen;j++){
-        tempwave[i*param.newlen+j].x=hostwaves[i+batch*batchsize][j];
-        tempwave[i*param.newlen+j].y=0.0;
-      }
-    }
+    ShortToComplex(hostwaves,tempwave,batch,batchsize,param.newlen);
     checkCudaErrors(cudaMemcpy(gpuwaves, tempwave, bulksize, cudaMemcpyHostToDevice));
     //now do the FFT on these waveforms
     checkCudaErrors(cufftExecC2C(plan, (cufftComplex*)gpuwaves,(cufftComplex*)gpuwaves,CUFFT_FORWARD));
@@ -283,12 +289,7 @@ void GPUConvolution(short** hostwaves,Complex *gpuwaves, Complex *gpufilter,cuff
   //now for what is left
   if(leftover!=0){
     std::cout<<"analyzing leftover waves"<<std::endl;
-    for(int i = 0;i<leftover;i++){
-      for(int j = 0;j<param.newlen;j++){
-        tempwave[i*param.newlen+j].x=hostwaves[i+numbatch*batchsize][j];
-        tempwave[i*param.newlen+j].y=0.0f;
-      }
-    }
+    ShortToComplex(hostwaves,tempwave,numbatch,leftover,param.newlen);
     for(int i = leftover;i<batchsize;i++){//fill extra slots with blanks
       for(int j = 0;j<param.newlen;j++){
         tempwave[i*param.newlen+j].x=0.0f;

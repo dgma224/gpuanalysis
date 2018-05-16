@@ -45,3 +45,9 @@ Each waveform:
 
 The output follows this exact same format currently (will be updated to floats when I can work on a computer with more RAM, my laptop doesn't have enough). 
 
+
+Update: Added a python script that can open the files. This has a few functions that can read these waveforms and plot them. 
+	load(path,num): opens the file given by path and reads num waveforms from it (starting from the beginning). This returns the headers and waveforms in two different variables.
+	baselineshift(waves,pretrig): given the waveforms returned from load, and the length of the pretrigger, this does the bit shift and the baseline shift to properly view the original waveforms.
+	shiftone(waves,pretrig): this is the exact same thing as the above function but only for one waveform
+	plotwave(waveid,path1,path2): opens two binary files given in path1 and path2 and plots the waveform given by waveid. This performs the baselineshift function on the first path given
