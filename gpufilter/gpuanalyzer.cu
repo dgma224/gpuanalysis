@@ -66,7 +66,7 @@ void DataOutput(WAVEFORM*,short**, PARAMS, int,int,double);
 void getdatafiles(PARAMS&);
 void baselineshift(short*,PARAMS);
 void waveshift(Complex *, Complex *,PARAMS);
-void ShortToComplex(short **, Complex *, int, int, int);
+void ShortToComplex(short **, Complex *, int, int, PARAMS);
 
 //debug printing functions
 void ComplexDebug(Complex*,int,char*);
@@ -202,7 +202,7 @@ double OpenDataFile(WAVEFORM** wavedat,short*** waveforms,const char *filename,P
   WAVEFORM* tempwavedat=(WAVEFORM*)malloc(sizeof(WAVEFORM)*numwaves);
   short** tempwaves=(short**)malloc((long)numwaves*sizeof(short*));
   for(int i = 0;i<numwaves;i++){
-    tempwaves[i]=(short*)calloc(param.newlen,sizeof(short));
+    tempwaves[i]=(short*)calloc(param.np,sizeof(short));
   }
   //now allocate each waveform storage location
   double initval;
@@ -234,11 +234,15 @@ __global__ void multiplication(Complex *data, Complex *filter, int length, float
 	}
 }
 
-void ShortToComplex(short **sdata, Complex *cdata, int startloc, int batchsize, int length){
+void ShortToComplex(short **sdata, Complex *cdata, int startloc, int batchsize, PARAMS param){
   for(int i = 0;i<batchsize;i++){
-    for(int j = 0;j<length;j++){
-      cdata[i*length+j].x=sdata[i+startloc*batchsize][j];
-      cdata[i*length+j].y=0.0;
+    for(int j = 0;j<param.np;j++){
+      cdata[i*param.newlen+j].x=sdata[i+startloc*batchsize][j];
+      cdata[i*param.newlen+j].y=0.0;
+    }
+    for(int j = param.np;j<param.newlen;j++){
+      cdata[i*param.newlen+j].x=0.0;
+      cdata[i*param.newlen+j].y=0.0;
     }
   }
 }
@@ -261,7 +265,7 @@ void GPUConvolution(short** hostwaves,Complex *gpuwaves, Complex *gpufilter,cuff
   for(int batch=0;batch<numbatch;batch++){
     //copy waveforms over
     std::cout<<batch<<" : "<<numbatch<<std::endl;
-    ShortToComplex(hostwaves,tempwave,batch,batchsize,param.newlen);
+    ShortToComplex(hostwaves,tempwave,batch,batchsize,param);
     checkCudaErrors(cudaMemcpy(gpuwaves, tempwave, bulksize, cudaMemcpyHostToDevice));
     //now do the FFT on these waveforms
     checkCudaErrors(cufftExecC2C(plan, (cufftComplex*)gpuwaves,(cufftComplex*)gpuwaves,CUFFT_FORWARD));
@@ -281,7 +285,7 @@ void GPUConvolution(short** hostwaves,Complex *gpuwaves, Complex *gpufilter,cuff
       waveshift(&temp[i*param.newlen],&tempwave[i*param.newlen],param);
     }
     for(int i = 0;i<batchsize;i++){
-      for(int j = 0;j<param.newlen;j++){
+      for(int j = 0;j<param.np;j++){
         hostwaves[i+batch*batchsize][j]=temp[i*param.newlen+j].x;
       }
     }  
@@ -289,7 +293,7 @@ void GPUConvolution(short** hostwaves,Complex *gpuwaves, Complex *gpufilter,cuff
   //now for what is left
   if(leftover!=0){
     std::cout<<"analyzing leftover waves"<<std::endl;
-    ShortToComplex(hostwaves,tempwave,numbatch,leftover,param.newlen);
+    ShortToComplex(hostwaves,tempwave,numbatch,leftover,param);
     for(int i = leftover;i<batchsize;i++){//fill extra slots with blanks
       for(int j = 0;j<param.newlen;j++){
         tempwave[i*param.newlen+j].x=0.0f;
@@ -317,7 +321,7 @@ void GPUConvolution(short** hostwaves,Complex *gpuwaves, Complex *gpufilter,cuff
     }
     //change the final location a bit, but everything else is the same easily enough
     for(int i = 0;i<leftover;i++){
-      for(int j = 0;j<param.newlen;j++){
+      for(int j = 0;j<param.np;j++){
         hostwaves[i+numbatch*batchsize][j]=temp[i*param.newlen+j].x;
       }
     }  
