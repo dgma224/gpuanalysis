@@ -73,7 +73,8 @@ void ComplexDebug(Complex*,int,char*);
 void ShortDebug(short*,int,char*);
 
 //gpu functions
-void GPUConvolution(short**,Complex*,Complex*,cufftHandle,int,int,PARAMS,size_t,int);
+void GPUConvolution(short**,Complex*,cufftHandle,int,PARAMS,size_t,int);
+void CPUGPUOverlapConvolution(short**,Complex*,cufftHandle,int, PARAMS, size_t,int);
 __global__ void multiplication(Complex*,const Complex *, int, float);
 
 int main(int argc, char* argv[]){
@@ -83,19 +84,19 @@ int main(int argc, char* argv[]){
   filparams(param);
   getdatafiles(param);
   //with parameters found now, create the filter
-  Complex *filter = (Complex*)malloc(sizeof(Complex)*param.np);
+  //create the filter with the larger size, just don't do the shift, it isn't neededn
+	int minRadius = param.np / 2;
+	int maxRadius = param.np - minRadius;
+	param.newlen = param.np + maxRadius;	
+  Complex *filter = (Complex*)calloc(param.newlen,sizeof(Complex));
   filtergen(filter,param);
-  //reverseArray(filter,0,param.np);
-  //now that the filters are all defined on RAM, pad them accordingly and move to GPU
-  Complex *padfilter;
-  param.newlen = PadFilter(filter,&padfilter,param.np);
   size_t onesize = sizeof(Complex)*param.newlen;
   size_t bulksize = sizeof(Complex)*param.newlen*batchsize;
-  Complex *gpufil, *gpubulkfil;
-  //now that the padded filter has been created, move it to GPU
-  checkCudaErrors(cudaMalloc(&gpufil, onesize));
+  Complex *gpufil,*gpubulkfil;
+  checkCudaErrors(cudaMalloc(&gpufil,onesize));
+  checkCudaErrors(cudaMemcpy(gpufil,filter,param.newlen*sizeof(Complex),cudaMemcpyHostToDevice));
 
-  checkCudaErrors(cudaMemcpy(gpufil,padfilter,onesize, cudaMemcpyHostToDevice));
+//rejoin location
   //now copy this filter for as many waveforms as will be used
   checkCudaErrors(cudaMalloc(&gpubulkfil,bulksize));
   for(int i = 0;i<batchsize;i++){
@@ -106,9 +107,6 @@ int main(int argc, char* argv[]){
   checkCudaErrors(cufftPlan1d(&plan,param.newlen,CUFFT_C2C,batchsize));
   checkCudaErrors(cufftExecC2C(plan, (cufftComplex*)gpubulkfil,(cufftComplex*)gpubulkfil, CUFFT_FORWARD));
   //the filter is ready to go for convolution now
-  //go ahead and allocate the GPU data storage
-  Complex *gpudata;
-  checkCudaErrors(cudaMalloc(&gpudata,bulksize));
   //iterate once per data file
   int numfiles = param.datafiles.size();
   for(int file = 0;file<numfiles;file++){
@@ -121,9 +119,7 @@ int main(int argc, char* argv[]){
       baselineshift(waveforms[i],param);
     }
     //at this point waveforms are ready to be copied over, handle them in batches
-    int numbatch=numwaves/batchsize;
-    int leftover=numwaves%batchsize;
-    GPUConvolution(waveforms, gpudata, gpubulkfil, plan, numbatch, leftover, param, bulksize, batchsize);  
+    CPUGPUOverlapConvolution(waveforms, gpubulkfil, plan, numwaves, param, bulksize, batchsize);  
     //now output convolved data properly
     DataOutput(wavedat,waveforms,param,file,numwaves,startval);
     free(wavedat);
@@ -131,11 +127,10 @@ int main(int argc, char* argv[]){
       free(waveforms[i]);
     }
   }
-  free(filter);
-  free(padfilter);
+  //free(filter);
+  //free(padfilter);
   checkCudaErrors(cudaFree(gpufil));
   checkCudaErrors(cudaFree(gpubulkfil));
-  checkCudaErrors(cudaFree(gpudata));
   checkCudaErrors(cufftDestroy(plan));
   return 0;
 }
@@ -247,9 +242,127 @@ void ShortToComplex(short **sdata, Complex *cdata, int startloc, int batchsize, 
   }
 }
       
+void CPUGPUOverlapConvolution(short** hostwaves, Complex *gpufilter,cufftHandle plan1, int numwaves, PARAMS param, size_t bulksize,int batchsize){
+  //this version of the convolution overlaps the CPU work of shifting waveforms
+  //and loading them into the complex buffer while the GPU works
+  //this doesn't use cudaStreams
+  
+  //first figure out how many batches to do
+  int numbatch=numwaves/batchsize;
+  int leftover=numwaves%batchsize;
+  int lastbatch=0;
+  if(numbatch%2==1){//if we have an odd number of batches
+    numbatch-=1;    
+    lastbatch=1;
+  }
+  int threads = 1024;
+  int blocks = 0;
+  if((batchsize*param.newlen)%threads==0){
+    blocks=batchsize*param.newlen/threads;
+  }
+  else{
+    blocks=batchsize*param.newlen/threads+1;
+  }
+  //we want two different streams to be running at a time that are overlapping
+  //for the first one, is just the very first data set normally
+  float scale = param.scale/((float)param.newlen);
+  Complex *tempwave1;
+  Complex *tempwave2;
+  checkCudaErrors(cudaMallocHost(&tempwave1,param.newlen*batchsize*sizeof(Complex)));
+  checkCudaErrors(cudaMallocHost(&tempwave2,param.newlen*batchsize*sizeof(Complex)));
+  //setup the cufft plans and streams along with data storage
+  Complex *gpuwaves1,*gpuwaves2;
+  checkCudaErrors(cudaMalloc(&gpuwaves1,bulksize));
+  checkCudaErrors(cudaMalloc(&gpuwaves2,bulksize)); 
+  //create two cudaStreams
+  cudaStream_t stream1,stream2; 
+  cudaStreamCreate(&stream1);
+  cudaStreamCreate(&stream2);
+  //create the other plan
+  cufftHandle plan2;
+  checkCudaErrors(cufftPlan1d(&plan2,param.newlen,CUFFT_C2C,batchsize));
+  cufftSetStream(plan1,stream1);
+  cufftSetStream(plan2,stream2);
+  checkCudaErrors(cudaDeviceSynchronize());
+  //now have created both streams and plans, should be good to go
+  for(int batch=0;batch<numbatch;batch+=2){//step by two each time
+    //wave1 prep 
+    ShortToComplex(hostwaves,tempwave1,batch,batchsize,param);
+    cudaMemcpyAsync(gpuwaves1,tempwave1,bulksize,cudaMemcpyHostToDevice,stream1);
+    cufftExecC2C(plan1,(cufftComplex*)gpuwaves1,(cufftComplex*)gpuwaves1,CUFFT_FORWARD);
+    multiplication<<<blocks,threads,0,stream1>>>(gpuwaves1,gpufilter,batchsize*param.newlen, scale);
+    cufftExecC2C(plan1,(cufftComplex*)gpuwaves1,(cufftComplex*)gpuwaves1,CUFFT_INVERSE);
+    //now setup the other waves while we are waiting for that to finish
+    ShortToComplex(hostwaves,tempwave2,batch+1,batchsize,param);
+    cudaStreamSynchronize(stream2);
+    cudaMemcpyAsync(gpuwaves2,tempwave2,bulksize,cudaMemcpyHostToDevice,stream2);
+    //now we need to start the analysis on wave2 and copy back the other stuff
+    cudaMemcpyAsync(tempwave1,gpuwaves1,bulksize,cudaMemcpyDeviceToHost,stream1);
+    //start up the analysis on stream2 now
+    cufftExecC2C(plan2,(cufftComplex*)gpuwaves2,(cufftComplex*)gpuwaves2,CUFFT_FORWARD);
+    multiplication<<<blocks,threads,0,stream2>>>(gpuwaves2,gpufilter,batchsize*param.newlen, scale);
+    cufftExecC2C(plan2,(cufftComplex*)gpuwaves2,(cufftComplex*)gpuwaves2,CUFFT_INVERSE);
+    //now store the results from stream 1 after synchronization 
+    cudaStreamSynchronize(stream1);
+    for(int i = 0;i<batchsize;i++){
+      for(int j = 0;j<param.np;j++){
+        hostwaves[i+batch*batchsize][j]=tempwave1[i*param.newlen+j].x;
+      }
+    }  
+    //now do the storage of stuff from stream 2
+    cudaMemcpyAsync(tempwave2,gpuwaves2,bulksize,cudaMemcpyDeviceToHost,stream2);
+    cudaStreamSynchronize(stream2);
+    for(int i = 0;i<batchsize;i++){
+      for(int j = 0;j<param.np;j++){
+        hostwaves[i+(batch+1)*batchsize][j]=tempwave2[i*param.newlen+j].x;
+      }
+    } 
+  }  
+  //now the main batches are done, now do the extra batch if the number of batches was even
+  if(lastbatch==1){
+    //we have one more batch to do
+    int batch=numbatch-1;
+    ShortToComplex(hostwaves,tempwave1,batch,batchsize,param);
+    cufftExecC2C(plan1,(cufftComplex*)gpuwaves1,(cufftComplex*)gpuwaves1,CUFFT_FORWARD);
+    multiplication<<<blocks,threads,0,stream1>>>(gpuwaves1,gpufilter,batchsize*param.newlen, scale);
+    cufftExecC2C(plan1,(cufftComplex*)gpuwaves1,(cufftComplex*)gpuwaves1,CUFFT_INVERSE);
+    cudaMemcpyAsync(tempwave1,gpuwaves1,bulksize,cudaMemcpyDeviceToHost,stream1);
+    for(int i = 0;i<batchsize;i++){
+      for(int j = 0;j<param.np;j++){
+        hostwaves[i+(batch)*batchsize][j]=tempwave2[i*param.newlen+j].x;
+      }
+    } 
+  }
+  //now do the partial batch at the end
+  if(leftover!=0){
+    ShortToComplex(hostwaves,tempwave1,numbatch,leftover,param);
+    for(int i = leftover;i<batchsize;i++){//fill extra slots with blanks
+      for(int j = 0;j<param.newlen;j++){
+        tempwave1[i*param.newlen+j].x=0.0f;
+        tempwave1[i*param.newlen+j].y=0.0f;
+      }
+    }
+    cudaMemcpyAsync(gpuwaves1, tempwave1, bulksize, cudaMemcpyHostToDevice,stream1);
+    cufftExecC2C(plan1, (cufftComplex*)gpuwaves1,(cufftComplex*)gpuwaves1, CUFFT_FORWARD);
+		multiplication<<<blocks,threads,0,stream1>>>(gpuwaves1, gpufilter ,batchsize*param.newlen, scale);
+    cufftExecC2C(plan1,(cufftComplex*)gpuwaves1,(cufftComplex*)gpuwaves1,CUFFT_INVERSE);
+    cudaMemcpyAsync(tempwave1,gpuwaves1,bulksize,cudaMemcpyDeviceToHost,stream1);
+    checkCudaErrors(cudaStreamSynchronize(stream1));
+    //change the final location a bit, but everything else is the same easily enough
+    for(int i = 0;i<leftover;i++){
+      for(int j = 0;j<param.np;j++){
+        hostwaves[i+numbatch*batchsize][j]=tempwave1[i*param.newlen+j].x;
+      }
+    }  
+  }
+}
 
-void GPUConvolution(short** hostwaves,Complex *gpuwaves, Complex *gpufilter,cufftHandle plan, int numbatch, int leftover, PARAMS param, size_t bulksize,int batchsize){
+void GPUConvolution(short** hostwaves, Complex *gpufilter,cufftHandle plan, int numwaves, PARAMS param, size_t bulksize,int batchsize){
+  int numbatch=numwaves/batchsize;
+  int leftover=numwaves%batchsize;
   checkCudaErrors(cudaSetDevice(0));
+  Complex *gpuwaves;
+  checkCudaErrors(cudaMalloc(&gpuwaves,bulksize));
   //first make this the simplistic version, then will optimize later
   int threads = 1024;
   int blocks = 0;
@@ -259,9 +372,9 @@ void GPUConvolution(short** hostwaves,Complex *gpuwaves, Complex *gpufilter,cuff
   else{
     blocks=batchsize*param.newlen/threads+1;
   }
-  Complex *tempwave = (Complex*)calloc(param.newlen*batchsize,sizeof(Complex));
   float scale = param.scale/((float)param.newlen);
-  Complex *temp = (Complex*)calloc(param.newlen*batchsize,sizeof(Complex));
+  Complex *tempwave;
+  checkCudaErrors(cudaMallocHost(&tempwave,param.newlen*batchsize*sizeof(Complex)));
   for(int batch=0;batch<numbatch;batch++){
     //copy waveforms over
     std::cout<<batch<<" : "<<numbatch<<std::endl;
@@ -269,9 +382,6 @@ void GPUConvolution(short** hostwaves,Complex *gpuwaves, Complex *gpufilter,cuff
     checkCudaErrors(cudaMemcpy(gpuwaves, tempwave, bulksize, cudaMemcpyHostToDevice));
     //now do the FFT on these waveforms
     checkCudaErrors(cufftExecC2C(plan, (cufftComplex*)gpuwaves,(cufftComplex*)gpuwaves,CUFFT_FORWARD));
-    //copy back for debugging
-    checkCudaErrors(cudaMemcpy(tempwave,gpuwaves,bulksize,cudaMemcpyDeviceToHost));
-    checkCudaErrors(cudaDeviceSynchronize());
     //now do the dot product on these waves
 		multiplication<<<blocks,threads>>>(gpuwaves, gpufilter ,batchsize*param.newlen,scale);
     //dot product is done, apply the bulk inverse FFT
@@ -280,13 +390,9 @@ void GPUConvolution(short** hostwaves,Complex *gpuwaves, Complex *gpufilter,cuff
     //now move back to host
     checkCudaErrors(cudaMemcpy(tempwave,gpuwaves,bulksize,cudaMemcpyDeviceToHost));
     checkCudaErrors(cudaDeviceSynchronize());
-    //now shift data over
-    for(int i = 0;i<batchsize;i++){
-      waveshift(&temp[i*param.newlen],&tempwave[i*param.newlen],param);
-    }
     for(int i = 0;i<batchsize;i++){
       for(int j = 0;j<param.np;j++){
-        hostwaves[i+batch*batchsize][j]=temp[i*param.newlen+j].x;
+        hostwaves[i+batch*batchsize][j]=tempwave[i*param.newlen+j].x;
       }
     }  
   }
@@ -315,19 +421,14 @@ void GPUConvolution(short** hostwaves,Complex *gpuwaves, Complex *gpufilter,cuff
     //now move back to host
     checkCudaErrors(cudaMemcpy(tempwave,gpuwaves,bulksize,cudaMemcpyDeviceToHost));
     checkCudaErrors(cudaDeviceSynchronize());
-    //now shift data over, only the ones we care about again
-    for(int i = 0;i<leftover;i++){
-      waveshift(&temp[i*param.newlen],&tempwave[i*param.newlen],param);
-    }
     //change the final location a bit, but everything else is the same easily enough
     for(int i = 0;i<leftover;i++){
       for(int j = 0;j<param.np;j++){
-        hostwaves[i+numbatch*batchsize][j]=temp[i*param.newlen+j].x;
+        hostwaves[i+numbatch*batchsize][j]=tempwave[i*param.newlen+j].x;
       }
     }  
   }
-  free(temp);
-  free(tempwave);
+  checkCudaErrors(cudaFreeHost(tempwave));
 }
 
 void waveshift(Complex *wave, Complex *tempwave,PARAMS param){
