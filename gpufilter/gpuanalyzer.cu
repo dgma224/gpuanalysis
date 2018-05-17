@@ -42,6 +42,7 @@ struct WAVEFORM {
 };
 //Parameter File Inputs for Filters
 struct PARAMS {
+  int batchsize;
   std::string filtertype;
   int top;
   int rise;
@@ -78,11 +79,11 @@ void CPUGPUOverlapConvolution(short**,Complex*,cufftHandle,int, PARAMS, size_t,i
 __global__ void multiplication(Complex*,const Complex *, int, float);
 
 int main(int argc, char* argv[]){
-  int batchsize = 2048;
   //no input expected, only takes in information from parameter files
   PARAMS param;
   filparams(param);
   getdatafiles(param);
+  int batchsize = param.batchsize;
   //with parameters found now, create the filter
   //create the filter with the larger size, just don't do the shift, it isn't neededn
 	int minRadius = param.np / 2;
@@ -544,6 +545,7 @@ void trapfiltergen(Complex *filter, PARAMS param){
 
 //setup default parameters
 void paramdefault(PARAMS& param){
+  param.batchsize=2048;
   param.filtertype="";
   param.top=0;
   param.rise=0;
@@ -562,6 +564,7 @@ void filparams(PARAMS& param){
   std::ifstream pfin;
   pfin.open("param.dat");
   if(pfin.is_open()){
+    pfin >> param.batchsize;
     pfin >> param.filtertype;
     if(param.filtertype=="trapfilter"){//if the user requested trapezoidal filter get those inputs
       pfin >> param.np;
