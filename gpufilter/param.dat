@@ -1,2 +1,2 @@
-4096 trapfilter 3500 100 1000 1000.0
+10 trapfilter 3500 100 1000 1000.0
 #filtertype length top rise tau

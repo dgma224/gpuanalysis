@@ -19,6 +19,9 @@ custom filelocation np
 #include <string.h>
 #include <fstream>
 #include <vector>
+#include <algorithm>//included for memory transitions from short to float
+#include <complex.h>
+#include <chrono>
 
 //CUDA inclusions
 #include <cuda_runtime.h>
@@ -50,15 +53,16 @@ struct PARAMS {
   float scale;
   int np;
   int newlen;
+  int halflen;
   std::string customloc;
   std::vector<std::string> datafiles;
 };
 //Function Definitions
-void trapfiltergen(Complex*,PARAMS);//generate trap filter
+void trapfiltergen(float*,PARAMS);//generate trap filter
 void filparams(PARAMS&);//get parameters from file
 void paramdefault(PARAMS&);//default parameter values in case of file error
-void filtergen(Complex*,PARAMS);
-void getcustomfil(Complex*,PARAMS);
+void filtergen(float*,PARAMS);
+void getcustomfil(float*,PARAMS);
 void reverseArray(Complex *array,int start,int end);
 int PadFilter(const Complex *, Complex **, int);
 void PadData(const short *, short **,int);
@@ -72,10 +76,13 @@ void ShortToComplex(short **, Complex *, int, int, PARAMS);
 //debug printing functions
 void ComplexDebug(Complex*,int,char*);
 void ShortDebug(short*,int,char*);
+void FloatDebug(float*,int,char*);
 
 //gpu functions
 void GPUConvolution(short**,Complex*,cufftHandle,int,PARAMS,size_t,int);
 void CPUGPUOverlapConvolution(short**,Complex*,cufftHandle,int, PARAMS, size_t,int);
+void CPUGPUOverlapConvolutionFloat(short**,Complex*,int, PARAMS);
+void CPUGPUConvolutionFloat(short**,Complex*,cufftHandle,int,PARAMS,size_t,int);
 __global__ void multiplication(Complex*,const Complex *, int, float);
 
 int main(int argc, char* argv[]){
@@ -86,27 +93,31 @@ int main(int argc, char* argv[]){
   int batchsize = param.batchsize;
   //with parameters found now, create the filter
   //create the filter with the larger size, just don't do the shift, it isn't neededn
-	int minRadius = param.np / 2;
-	int maxRadius = param.np - minRadius;
-	param.newlen = param.np + maxRadius;	
-  Complex *filter = (Complex*)calloc(param.newlen,sizeof(Complex));
-  filtergen(filter,param);
-  size_t onesize = sizeof(Complex)*param.newlen;
-  size_t bulksize = sizeof(Complex)*param.newlen*batchsize;
-  Complex *gpufil,*gpubulkfil;
-  checkCudaErrors(cudaMalloc(&gpufil,onesize));
-  checkCudaErrors(cudaMemcpy(gpufil,filter,param.newlen*sizeof(Complex),cudaMemcpyHostToDevice));
+  param.newlen=param.np;//currently newlen will still be used, just in case shifts need to be applied	
+  float *filter = (float*)calloc(param.newlen,sizeof(float));
+  filtergen(filter,param); 
+  size_t floatone = sizeof(float)*param.newlen;
+  size_t floatmul = sizeof(float)*param.newlen*batchsize;
+  //setup np/2+1 lengths,CUFFT_R2C decreases by this size
+  param.halflen = param.newlen/2+1;
+  //size_t onesize = sizeof(Complex)*param.halflen;
+  size_t bulksize = sizeof(Complex)*param.halflen*batchsize;
+  float *fgpufil,*fgpubulkfil;
+  checkCudaErrors(cudaMalloc(&fgpufil,floatone));
+  checkCudaErrors(cudaMemcpy(fgpufil,filter,floatone,cudaMemcpyHostToDevice));
 
-//rejoin location
   //now copy this filter for as many waveforms as will be used
-  checkCudaErrors(cudaMalloc(&gpubulkfil,bulksize));
+  checkCudaErrors(cudaMalloc(&fgpubulkfil,floatmul));
   for(int i = 0;i<batchsize;i++){
-    checkCudaErrors(cudaMemcpy(&gpubulkfil[param.newlen*i],gpufil, onesize, cudaMemcpyDeviceToDevice));
+    checkCudaErrors(cudaMemcpy(&fgpubulkfil[param.newlen*i],fgpufil, floatone, cudaMemcpyDeviceToDevice));
   }
   //now create the FFT plan and execute it on the filter
+  //need to first create bulk complex filter storage
+  Complex *gpufil;
+  checkCudaErrors(cudaMalloc(&gpufil,bulksize));
   cufftHandle plan;
-  checkCudaErrors(cufftPlan1d(&plan,param.newlen,CUFFT_C2C,batchsize));
-  checkCudaErrors(cufftExecC2C(plan, (cufftComplex*)gpubulkfil,(cufftComplex*)gpubulkfil, CUFFT_FORWARD));
+  checkCudaErrors(cufftPlan1d(&plan,param.newlen,CUFFT_R2C,batchsize));
+  checkCudaErrors(cufftExecR2C(plan, fgpubulkfil,gpufil));
   //the filter is ready to go for convolution now
   //iterate once per data file
   int numfiles = param.datafiles.size();
@@ -115,12 +126,12 @@ int main(int argc, char* argv[]){
     WAVEFORM * wavedat;
     short **waveforms;
     double startval = OpenDataFile(&wavedat,&waveforms, param.datafiles.at(file).c_str(),param,numwaves);
-    //now the waveforms are all read in, do the baseline shift and waveform padding
-    for(int i = 0;i<numwaves;i++){
-      baselineshift(waveforms[i],param);
-    }
     //at this point waveforms are ready to be copied over, handle them in batches
-    CPUGPUOverlapConvolution(waveforms, gpubulkfil, plan, numwaves, param, bulksize, batchsize);  
+    auto start = std::chrono::system_clock::now();
+    CPUGPUOverlapConvolutionFloat(waveforms, gpufil, numwaves, param);
+    auto end = std::chrono::system_clock::now();
+    std::chrono::duration<double> t = end - start;
+    std::cout<<param.datafiles.at(file)<<" : "<<numwaves<<" : "<<t.count()<<std::endl;  
     //now output convolved data properly
     DataOutput(wavedat,waveforms,param,file,numwaves,startval);
     free(wavedat);
@@ -131,7 +142,8 @@ int main(int argc, char* argv[]){
   //free(filter);
   //free(padfilter);
   checkCudaErrors(cudaFree(gpufil));
-  checkCudaErrors(cudaFree(gpubulkfil));
+  checkCudaErrors(cudaFree(fgpubulkfil));
+  checkCudaErrors(cudaFree(fgpufil));
   checkCudaErrors(cufftDestroy(plan));
   return 0;
 }
@@ -140,8 +152,9 @@ void ComplexDebug(Complex *data,int length,char *filename){
   FILE *fout;
   fout = fopen(filename,"w");
   for(int i = 0;i<length;i++){
-    fprintf(fout,"%f\n",data[i].x);
+    fprintf(fout,"%f %f\n",data[i].x,data[i].y);
   }
+  fclose(fout);
   std::cout<<filename<<" has been printed"<<std::endl;
 }
 
@@ -151,8 +164,20 @@ void ShortDebug(short *data,int length,char *filename){
   for(int i = 0;i<length;i++){
     fprintf(fout,"%d\n",data[i]);
   }
+  fclose(fout);
   std::cout<<filename<<" has been printed"<<std::endl;
 }
+
+void FloatDebug(float *data,int length,char *filename){
+  FILE *fout;
+  fout = fopen(filename,"w");
+  for(int i = 0;i<length;i++){
+    fprintf(fout,"%f\n",data[i]);
+  }
+  fclose(fout);
+  std::cout<<filename<<" has been printed"<<std::endl;
+}
+
 
 void DataOutput(WAVEFORM* wavedat, short **waveforms, PARAMS param, int numfile, int numwaves, double start){
   //this opens a data file for output
@@ -220,7 +245,7 @@ double OpenDataFile(WAVEFORM** wavedat,short*** waveforms,const char *filename,P
   return initval;
 }
 
-__global__ void multiplication(Complex *data, Complex *filter, int length, float scale){
+__global__ void multiplication(Complex *data, const Complex *filter, int length, float scale){
 	int i = threadIdx.x + blockIdx.x * blockDim.x;
 	if(i < length){
 		Complex temp;
@@ -242,12 +267,159 @@ void ShortToComplex(short **sdata, Complex *cdata, int startloc, int batchsize, 
     }
   }
 }
-      
+ 
+void ShortToFloat(short **sdata, float *fdata, int startloc, int batchsize, PARAMS param){
+  for(int i = 0;i<batchsize;i++){
+    std::copy(&sdata[i+startloc*batchsize][0],&sdata[i+startloc*batchsize][param.np-1], &fdata[i*param.newlen]);
+    //memset(&fdata[i*param.newlen+param.np], 0, (param.newlen-param.np)*sizeof(float));  
+  } 
+}
+
+void CPUGPUOverlapConvolutionFloat(short** hostwaves, Complex *gpufilter, int numwaves, PARAMS param){
+  //this is effectively the same function as the CPUGPUOverlapConvolution
+  //but this uses less host ram and may be less CPU intensive due to using
+  //float to complex and complex to float fourier transforms instead of
+  //complex to complex
+  //Everything else is the same
+  //in this case, we actually don't use the cufftHandles given in the input parameters
+  int batchsize=param.batchsize;
+  size_t bulksize = param.batchsize*sizeof(Complex)*param.halflen;
+  int numbatch=numwaves/batchsize;
+  int leftover=numwaves%batchsize;
+  int lastbatch=0;
+  if(numbatch%2==1){//if we have an odd number of batches
+    numbatch-=1;    
+    lastbatch=1;
+  }
+  int threads = 1024;
+  int blocks = 0;
+  if((batchsize*param.halflen)%threads==0){
+    blocks=batchsize*param.halflen/threads;
+  }
+  else{
+    blocks=batchsize*param.halflen/threads+1;
+  }
+  //we want two different streams to be running at a time that are overlapping
+  //for the first one, is just the very first data set normally
+  float scale = param.scale/((float)param.newlen);
+  float *tempwave1;
+  float *tempwave2;
+  size_t floatgpusize = batchsize*param.newlen*sizeof(float);
+  checkCudaErrors(cudaMallocHost(&tempwave1,floatgpusize));
+  checkCudaErrors(cudaMallocHost(&tempwave2,floatgpusize));
+
+  float *prefft1, *prefft2;//storage before the fft is applied
+  checkCudaErrors(cudaMalloc(&prefft1, floatgpusize));
+  checkCudaErrors(cudaMalloc(&prefft2, floatgpusize));
+  //setup the cufft plans and streams along with data storage
+  Complex *gpuwaves1,*gpuwaves2;//storage after fft is applied
+  checkCudaErrors(cudaMalloc(&gpuwaves1,bulksize));
+  checkCudaErrors(cudaMalloc(&gpuwaves2,bulksize)); 
+  //create two cudaStreams
+  cudaStream_t stream1,stream2; 
+  cudaStreamCreate(&stream1);
+  cudaStreamCreate(&stream2);
+  //create the plans, 2 for forward, 2 for reverse
+  cufftHandle plan1,plan2,plan1i,plan2i;
+  checkCudaErrors(cufftPlan1d(&plan1,param.newlen,CUFFT_R2C,batchsize));
+  checkCudaErrors(cufftPlan1d(&plan2,param.newlen,CUFFT_R2C,batchsize));
+  checkCudaErrors(cufftPlan1d(&plan1i,param.newlen,CUFFT_C2R,batchsize));
+  checkCudaErrors(cufftPlan1d(&plan2i,param.newlen,CUFFT_C2R,batchsize));
+  cufftSetStream(plan1,stream1);
+  cufftSetStream(plan2,stream2);
+  cufftSetStream(plan1i,stream1);
+  cufftSetStream(plan2i,stream2);
+  checkCudaErrors(cudaDeviceSynchronize());
+  for(int i = 0;i<numwaves;i++){
+    baselineshift(hostwaves[i],param);
+  }
+  //now have created both streams and plans, should be good to go
+  for(int batch=0;batch<numbatch;batch+=2){//step by two each time
+    //wave1 prep 
+    ShortToFloat(hostwaves,tempwave1,batch,batchsize,param);
+    cudaMemcpyAsync(prefft1,tempwave1,floatgpusize,cudaMemcpyHostToDevice,stream1);
+    cufftExecR2C(plan1,prefft1,gpuwaves1);
+    multiplication<<<blocks,threads,0,stream1>>>(gpuwaves1,gpufilter,batchsize*param.halflen, scale);
+    cufftExecC2R(plan1i,gpuwaves1,prefft1);
+    ShortToFloat(hostwaves,tempwave2,batch+1,batchsize,param); 
+    cudaMemcpyAsync(prefft2,tempwave2,floatgpusize,cudaMemcpyHostToDevice,stream2);
+    cudaMemcpyAsync(tempwave1,prefft1,floatgpusize,cudaMemcpyDeviceToHost,stream1);
+    cufftExecR2C(plan2,prefft2,gpuwaves2);
+    multiplication<<<blocks,threads,0,stream2>>>(gpuwaves2,gpufilter,batchsize*param.halflen, scale);
+    cufftExecC2R(plan2i,gpuwaves2,prefft2);    
+    cudaMemcpyAsync(tempwave2,prefft2,floatgpusize,cudaMemcpyDeviceToHost,stream2);
+    cudaStreamSynchronize(stream1);
+    for(int i = 0;i<batchsize;i++){
+      for(int j = 0;j<param.np;j++){
+        hostwaves[i+batch*batchsize][j]=tempwave1[i*param.newlen+j];
+      }
+    } 
+    cudaStreamSynchronize(stream2);
+    for(int i = 0;i<batchsize;i++){
+      for(int j = 0;j<param.np;j++){
+        hostwaves[i+(batch+1)*batchsize][j]=tempwave2[i*param.newlen+j];
+      }
+    }
+    
+  }  
+  //now the main batches are done, now do the extra batch if the number of batches was even
+  if(lastbatch==1){
+    //we have one more batch to do
+    int batch=numbatch-1;
+    ShortToFloat(hostwaves,tempwave1,batch,batchsize,param);
+    cudaMemcpyAsync(prefft1,tempwave1,floatgpusize,cudaMemcpyHostToDevice,stream1);
+    cufftExecR2C(plan1,prefft1,gpuwaves1);
+    multiplication<<<blocks,threads,0,stream1>>>(gpuwaves1,gpufilter,batchsize*param.halflen, scale);
+    cufftExecC2R(plan1,(cufftComplex*)gpuwaves1,prefft1);
+    cudaMemcpyAsync(tempwave1,prefft1,floatgpusize,cudaMemcpyDeviceToHost,stream1);
+    for(int i = 0;i<batchsize;i++){
+      for(int j = 0;j<param.np;j++){
+        hostwaves[i+(batch)*batchsize][j]=tempwave1[i*param.newlen+j];
+      }
+    } 
+  }
+  //now do the partial batch at the end
+  if(leftover!=0){
+    ShortToFloat(hostwaves,tempwave1,numbatch,leftover,param);
+    for(int i = leftover;i<batchsize;i++){//fill extra slots with blanks
+      for(int j = 0;j<param.newlen;j++){
+        tempwave1[i*param.newlen+j]=0.0f;
+      }
+    }
+    cudaMemcpyAsync(prefft1, tempwave1, floatgpusize, cudaMemcpyHostToDevice,stream1);
+    cufftExecR2C(plan1,prefft1,gpuwaves1);
+		multiplication<<<blocks,threads,0,stream1>>>(gpuwaves1, gpufilter ,batchsize*param.halflen, scale);
+    cufftExecC2R(plan1,gpuwaves1,prefft1);
+    cudaMemcpyAsync(tempwave1,prefft1,floatgpusize,cudaMemcpyDeviceToHost,stream1);
+    checkCudaErrors(cudaStreamSynchronize(stream1));
+    //change the final location a bit, but everything else is the same easily enough
+    for(int i = 0;i<leftover;i++){
+      for(int j = 0;j<param.np;j++){
+        hostwaves[i+numbatch*batchsize][j]=tempwave1[i*param.newlen+j];
+      }
+    }  
+  }
+  cudaFreeHost(&tempwave1);
+  cudaFreeHost(&tempwave2);
+  cudaFree(prefft1);
+  cudaFree(prefft2);
+  cudaFree(gpuwaves1);
+  cudaFree(gpuwaves2);
+  cufftDestroy(plan1);
+  cufftDestroy(plan2);
+  cufftDestroy(plan1i);
+  cufftDestroy(plan2i);
+  cudaStreamDestroy(stream1);
+  cudaStreamDestroy(stream2);
+  
+}
+     
 void CPUGPUOverlapConvolution(short** hostwaves, Complex *gpufilter,cufftHandle plan1, int numwaves, PARAMS param, size_t bulksize,int batchsize){
+  //NO LONGER WORKS!!! THIS EXPECTS A DIFFERENT FILTER TYPE ON GPU
+  //DO NOT USE UNTIL FILTER IS REDEFINED WITH CUFFT_C2C version
   //this version of the convolution overlaps the CPU work of shifting waveforms
   //and loading them into the complex buffer while the GPU works
   //this doesn't use cudaStreams
-  
   //first figure out how many batches to do
   int numbatch=numwaves/batchsize;
   int leftover=numwaves%batchsize;
@@ -286,8 +458,13 @@ void CPUGPUOverlapConvolution(short** hostwaves, Complex *gpufilter,cufftHandle 
   cufftSetStream(plan2,stream2);
   checkCudaErrors(cudaDeviceSynchronize());
   //now have created both streams and plans, should be good to go
+  for(int i = 0;i<numwaves;i++){
+    baselineshift(hostwaves[i],param);
+  }
   for(int batch=0;batch<numbatch;batch+=2){//step by two each time
     //wave1 prep 
+    //do baseline shift on waveforms
+
     ShortToComplex(hostwaves,tempwave1,batch,batchsize,param);
     cudaMemcpyAsync(gpuwaves1,tempwave1,bulksize,cudaMemcpyHostToDevice,stream1);
     cufftExecC2C(plan1,(cufftComplex*)gpuwaves1,(cufftComplex*)gpuwaves1,CUFFT_FORWARD);
@@ -359,6 +536,8 @@ void CPUGPUOverlapConvolution(short** hostwaves, Complex *gpufilter,cufftHandle 
 }
 
 void GPUConvolution(short** hostwaves, Complex *gpufilter,cufftHandle plan, int numwaves, PARAMS param, size_t bulksize,int batchsize){
+  //NO LONGER WORKS!!! THIS EXPECTS A DIFFERENT FILTER TYPE ON GPU
+  //DO NOT USE UNTIL FILTER IS REDEFINED WITH CUFFT_C2C version
   int numbatch=numwaves/batchsize;
   int leftover=numwaves%batchsize;
   checkCudaErrors(cudaSetDevice(0));
@@ -485,7 +664,7 @@ void getdatafiles(PARAMS& param){
 
 
 //function that controls the generation of the filters
-void filtergen(Complex *filter, PARAMS param){
+void filtergen(float *filter, PARAMS param){
   if(param.filtertype=="trapfilter"){//if using trapezoidal filter, call that function
     trapfiltergen(filter, param);
   }
@@ -494,7 +673,7 @@ void filtergen(Complex *filter, PARAMS param){
   }
 }
 
-void getcustomfil(Complex* filter, PARAMS param){
+void getcustomfil(float* filter, PARAMS param){
   //open file for custom filter
   std::ifstream filin;
   filin.open(param.customloc.c_str());
@@ -502,13 +681,11 @@ void getcustomfil(Complex* filter, PARAMS param){
   if(filin.is_open()){
     int loc = 0;
     for(int i; filin>>i;){
-      filter[loc].x=i;
-      filter[loc].y=0.0;
+      filter[loc]=i;
       loc++;
     }
     while(loc<param.np-1){
-      filter[loc].x=0.0;
-      filter[loc].y=0.0;
+      filter[loc]=0.0;
       loc++;
     }
   }
@@ -519,26 +696,22 @@ void getcustomfil(Complex* filter, PARAMS param){
 }
 
 //generate the trapezoidal filter based on parameters given
-void trapfiltergen(Complex *filter, PARAMS param){
+void trapfiltergen(float *filter, PARAMS param){
   int rise = param.rise;
   int top = param.top;
   int tau = param.tau;
   int np = param.np;
 	for (int i=0;i<rise;++i){
-		filter[i].x=tau+i;
-		filter[i].y=0;
-		filter[i+rise+top].x=rise-tau-(i);
-		filter[i+rise+top].y=0;
+		filter[i]=tau+i;
+		filter[i+rise+top]=rise-tau-(i);
 	}
 	for (int i=rise;i<rise+top;++i)
 	{
-		filter[i].x=rise;
-		filter[i].y=0;
+		filter[i]=rise;
 	}
 	//now pad the filter for the appropriate number of points
 	for(int i = rise+rise+top;i<np;i++){
-		filter[i].x = 0;
-		filter[i].y = 0;
+		filter[i] = 0;
 	}
 }
 
@@ -571,6 +744,7 @@ void filparams(PARAMS& param){
       pfin >> param.top;
       pfin >> param.rise;
       pfin >> param.tau;
+      param.scale = 1.0f/((float)param.rise*param.tau);
     }
     else if(param.filtertype=="custom"){//get custom file location
       pfin >> param.customloc;
@@ -586,7 +760,7 @@ void filparams(PARAMS& param){
     std::cout<<"param.dat failed to open: Code Exiting"<<std::endl;
     exit(1);
   }
-  param.scale = 1.0f/((float)param.rise*param.tau);
+  
   std::cout<<"Input Params:"<<std::endl;
   std::cout<<"\t FilterType: "<<param.filtertype<<std::endl;
   std::cout<<"\t Top: "<<param.top<<" Rise: "<<param.rise<<" Tau: "<<param.tau<<std::endl;

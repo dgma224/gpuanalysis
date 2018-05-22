@@ -1,6 +1,6 @@
 CUDA_PATH ?= "/usr/local/cuda-9.0"
 
-HOST_COMPILER ?= g++
+HOST_COMPILER ?= g++ -std=c++11
 NVCC := $(CUDA_PATH)/bin/nvcc -ccbin $(HOST_COMPILER)
 
 INCLUDES := -I/home/david/NVIDIA_CUDA-9.0_Samples/common/inc
